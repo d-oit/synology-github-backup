@@ -4,6 +4,8 @@ set -eu
 BACKUP_ROOT="/volume1/homes/Dominik/sourcecode/github"
 TOKENS_FILE="/volume1/homes/Dominik/sourcecode/github_tokens.txt"
 API_VERSION="2022-11-28"
+# Force HTTP/1.1 to avoid "HTTP/2 stream 1 was not closed cleanly" errors on Synology DSM
+CURL_OPTS="--http1.1 -fsSL"
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -20,21 +22,22 @@ mkdir -p "$BACKUP_ROOT"
 
 get_login() {
   token="$1"
-  curl -fsSL \
+  response=$(curl $CURL_OPTS \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${token}" \
     -H "X-GitHub-Api-Version: ${API_VERSION}" \
-    "https://api.github.com/user" | jq -r '.login'
+    "https://api.github.com/user" 2>&1) || true
+  printf '%s' "$response" | jq -r '.login // empty' 2>/dev/null || true
 }
 
 list_repos_page() {
   token="$1"
   page="$2"
-  curl -fsSL \
+  curl $CURL_OPTS \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${token}" \
     -H "X-GitHub-Api-Version: ${API_VERSION}" \
-    "https://api.github.com/user/repos?type=owner&per_page=100&page=${page}"
+    "https://api.github.com/user/repos?type=owner&per_page=100&page=${page}" || true
 }
 
 download_zipball() {
@@ -45,12 +48,17 @@ download_zipball() {
   tmpfile="$(mktemp "${outfile}.XXXXXX")"
   trap 'rm -f "$tmpfile"' INT TERM HUP EXIT
 
-  curl -fsSL \
+  curl $CURL_OPTS \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${token}" \
     -H "X-GitHub-Api-Version: ${API_VERSION}" \
     "https://api.github.com/repos/${full_name}/zipball" \
-    -o "$tmpfile"
+    -o "$tmpfile" || {
+      echo "WARNING: failed to download ${full_name}, skipping" >&2
+      rm -f "$tmpfile"
+      trap - INT TERM HUP EXIT
+      return 0
+    }
 
   mv "$tmpfile" "$outfile"
   trap - INT TERM HUP EXIT
@@ -68,10 +76,11 @@ while IFS= read -r OAUTH_TOKEN || [ -n "${OAUTH_TOKEN:-}" ]; do
     \#*) continue ;;
   esac
 
+  echo "Resolving login for token..."
   LOGIN="$(get_login "$OAUTH_TOKEN")"
 
-  if [ -z "$LOGIN" ] || [ "$LOGIN" = "null" ]; then
-    echo "ERROR: could not resolve GitHub login for one token" >&2
+  if [ -z "${LOGIN:-}" ]; then
+    echo "ERROR: could not resolve GitHub login — check token and network" >&2
     continue
   fi
 
@@ -83,7 +92,7 @@ while IFS= read -r OAUTH_TOKEN || [ -n "${OAUTH_TOKEN:-}" ]; do
   page=1
   while :; do
     JSON="$(list_repos_page "$OAUTH_TOKEN" "$page")"
-    COUNT="$(printf '%s' "$JSON" | jq 'length')"
+    COUNT="$(printf '%s' "$JSON" | jq 'length' 2>/dev/null || echo 0)"
     [ "$COUNT" -eq 0 ] && break
 
     printf '%s' "$JSON" | jq -r '.[] | [.name, .full_name] | @tsv' |
@@ -97,3 +106,5 @@ while IFS= read -r OAUTH_TOKEN || [ -n "${OAUTH_TOKEN:-}" ]; do
     page=$((page + 1))
   done
 done < "$TOKENS_FILE"
+
+echo "===== backup complete ====="
