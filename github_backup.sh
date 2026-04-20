@@ -4,10 +4,9 @@
 # Tokens file: one PAT per line, blank/comment lines ignored, CRLF stripped.
 # Logs are APPENDED to $LOG_FILE so history is preserved across runs.
 #
-# Busybox-safe: HTTP code via -o tmpfile + -w %{http_code}.
-# Download success is determined by non-empty output file only —
-# NOT by HTTP code, because busybox curl -L returns the redirect code (302)
-# instead of the final 200, which broke the mv step.
+# Busybox-safe: HTTP code via -o tmpfile + -w %{http_code} for API calls.
+# Download success = non-empty output file (busybox curl -L returns 302 not 200).
+# mv failure fallback: cp + rm so cross-device or permission issues are surfaced.
 
 BACKUP_ROOT="/volume1/homes/Dominik/sourcecode/github"
 TOKENS_FILE="/volume1/homes/Dominik/sourcecode/github_tokens.txt"
@@ -34,11 +33,20 @@ require_cmd curl
 require_cmd jq
 require_cmd mktemp
 
-# Clean up any leftover temp files from previous crashed runs
+# Verify BACKUP_ROOT is writable before doing anything
+if ! _wtest=$(mktemp "${BACKUP_ROOT}/.writetest.XXXXXX" 2>&1); then
+  err "BACKUP_ROOT is not writable: ${BACKUP_ROOT}"
+  err "mktemp error: ${_wtest}"
+  exit 1
+fi
+rm -f "$_wtest"
+
+# Clean up leftover temp files from previous crashed runs
 log "Cleaning up stale temp files in ${BACKUP_ROOT}..."
 find "$BACKUP_ROOT" -name '*.zip.*' -type f -delete 2>/dev/null || true
+find "$BACKUP_ROOT" -name '.writetest.*' -type f -delete 2>/dev/null || true
 
-# ── api_call: sets RESP_CODE and RESP_BODY ────────────────────────────────────
+# ── api_call: sets RESP_CODE and RESP_BODY ────────────────────────────────
 api_call() {
   _token="$1"; _url="$2"
   _body_tmp=$(mktemp)
@@ -53,10 +61,7 @@ api_call() {
   rm -f "$_body_tmp"
 }
 
-# ── api_download: downloads to file, success = non-empty file ─────────────────
-# We do NOT check HTTP code here because busybox curl -L reports the
-# redirect status (302) rather than the final response code (200).
-# A non-empty output file is the reliable success indicator.
+# ── api_download: downloads to file, success = non-empty file ─────────────
 api_download() {
   _token="$1"; _url="$2"; _outfile="$3"
   curl --http1.1 -sS -L \
@@ -68,7 +73,25 @@ api_download() {
   return $?
 }
 
-# ── get_login ─────────────────────────────────────────────────────────────────
+# ── safe_move: mv with cp+rm fallback, logs exact error ────────────────────
+safe_move() {
+  _src="$1"; _dst="$2"
+  if mv "$_src" "$_dst" 2>/tmp/mv_err; then
+    return 0
+  fi
+  _mverr=$(cat /tmp/mv_err 2>/dev/null)
+  warn "mv failed (${_mverr}), trying cp+rm fallback..."
+  if cp "$_src" "$_dst" 2>/tmp/cp_err; then
+    rm -f "$_src"
+    return 0
+  fi
+  _cperr=$(cat /tmp/cp_err 2>/dev/null)
+  err "cp also failed: ${_cperr}"
+  rm -f "$_src"
+  return 1
+}
+
+# ── get_login ───────────────────────────────────────────────────────────────
 get_login() {
   _token="$1"
   api_call "$_token" "https://api.github.com/user"
@@ -87,7 +110,7 @@ get_login() {
   printf '%s' "$_login"
 }
 
-# ── list_repos_page ───────────────────────────────────────────────────────────
+# ── list_repos_page ─────────────────────────────────────────────────────────
 list_repos_page() {
   _token="$1"; _page="$2"; _login="$3"
   api_call "$_token" \
@@ -101,7 +124,7 @@ list_repos_page() {
   printf '%s' "$RESP_BODY"
 }
 
-# ── download_zipball ──────────────────────────────────────────────────────────
+# ── download_zipball ───────────────────────────────────────────────────────
 download_zipball() {
   _token="$1"; _full_name="$2"; _outfile="$3"; _login="$4"
   _tmpfile=$(mktemp "${_outfile}.XXXXXX")
@@ -109,24 +132,24 @@ download_zipball() {
   if api_download "$_token" \
        "https://api.github.com/repos/${_full_name}/zipball" \
        "$_tmpfile" && [ -s "$_tmpfile" ]; then
-    mv "$_tmpfile" "$_outfile"
-    log "[${_login}] OK       ${_full_name}  ($(du -k "$_outfile" | cut -f1) KB)"
-    return 0
+    if safe_move "$_tmpfile" "$_outfile"; then
+      log "[${_login}] OK       ${_full_name}  ($(du -k "$_outfile" | cut -f1) KB)"
+      return 0
+    else
+      err "[${_login}] FAILED   ${_full_name}  (could not move/copy to ${_outfile})"
+      return 1
+    fi
   else
-    # Check if curl wrote a JSON error body (e.g. {"message":"Not Found"})
-    _errmsg=$(cat "$_tmpfile" 2>/dev/null | jq -r '.message // empty' 2>/dev/null || true)
+    _errmsg=$(jq -r '.message // empty' "$_tmpfile" 2>/dev/null || true)
     rm -f "$_tmpfile"
     if [ -n "${_errmsg:-}" ]; then
       case "${_errmsg}" in
-        *"empty"*|*"no default branch"*|*"409"*)
-          warn "[${_login}] EMPTY    ${_full_name}  (${_errmsg})"
-          return 2 ;;
+        *"empty"*|*"no default branch"*)
+          warn "[${_login}] EMPTY    ${_full_name}  (${_errmsg})"; return 2 ;;
         *"Not Found"*)
-          warn "[${_login}] NOTFOUND ${_full_name}  (${_errmsg})"
-          return 2 ;;
+          warn "[${_login}] NOTFOUND ${_full_name}  (${_errmsg})"; return 2 ;;
         *)
-          err  "[${_login}] FAILED   ${_full_name}  (${_errmsg})"
-          return 1 ;;
+          err  "[${_login}] FAILED   ${_full_name}  (${_errmsg})"; return 1 ;;
       esac
     else
       err "[${_login}] FAILED   ${_full_name}  (empty output, curl error)"
@@ -135,7 +158,7 @@ download_zipball() {
   fi
 }
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── main ───────────────────────────────────────────────────────────────────
 [ -f "$TOKENS_FILE" ] || { err "Tokens file not found: $TOKENS_FILE"; exit 1; }
 
 log "========== backup start  (pid $$) =========="
@@ -160,6 +183,14 @@ while IFS= read -r RAW_LINE || [ -n "${RAW_LINE:-}" ]; do
   log "[${LOGIN}] login OK"
   ACCOUNT_PATH="${BACKUP_ROOT}/${LOGIN}"
   mkdir -p "$ACCOUNT_PATH"
+
+  # Verify per-account dir is writable
+  if ! _wtest=$(mktemp "${ACCOUNT_PATH}/.writetest.XXXXXX" 2>&1); then
+    err "[${LOGIN}] account dir not writable: ${ACCOUNT_PATH} — ${_wtest}"
+    SCRIPT_SKIP_ACCOUNT=$((SCRIPT_SKIP_ACCOUNT + 1))
+    continue
+  fi
+  rm -f "$_wtest"
 
   ACCOUNT_OK=0; ACCOUNT_FAIL=0; ACCOUNT_SKIP=0
 
