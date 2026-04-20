@@ -1,14 +1,11 @@
 #!/bin/sh
 # github_backup.sh — Synology NAS multi-account GitHub ZIP backup
 #
-# Tokens file: one PAT per line, blank lines and lines starting with # ignored.
+# Tokens file: one PAT per line, blank/comment lines ignored, CRLF stripped.
 # Logs are APPENDED to $LOG_FILE so history is preserved across runs.
 #
-# Known issues handled:
-#   - HTTP/2 stream errors on Synology DSM  -> forced HTTP/1.1
-#   - Empty/uninitialised repos return 400  -> detected and skipped with WARN
-#   - Fine-grained PAT scope errors         -> raw GitHub error printed in log
-#   - Subshell counter loss in pipes        -> TSV written to temp file first
+# Busybox-safe: no pipefail, no -w sentinel parsing via grep/sed.
+# HTTP status captured by writing body and code to separate temp files.
 
 BACKUP_ROOT="/volume1/homes/Dominik/sourcecode/github"
 TOKENS_FILE="/volume1/homes/Dominik/sourcecode/github_tokens.txt"
@@ -16,8 +13,6 @@ LOG_FILE="/volume1/homes/Dominik/sourcecode/github_backup.log"
 API_VERSION="2022-11-28"
 
 mkdir -p "$(dirname "$LOG_FILE")" "$BACKUP_ROOT"
-
-# Append — do not overwrite previous run logs
 exec >> "$LOG_FILE" 2>&1
 
 ts()   { date '+%Y-%m-%d %H:%M:%S'; }
@@ -37,127 +32,109 @@ require_cmd curl
 require_cmd jq
 require_cmd mktemp
 
-# ── curl wrapper: returns "HTTP_CODE BODY" separated by a sentinel ─────────────
-# Always uses --http1.1 (fixes Synology DSM HTTP/2 stream errors)
-# Never uses -f so we always get the response body even on 4xx/5xx
+# ─────────────────────────────────────────────────────────────────────
+# api_call TOKEN URL -> sets $RESP_CODE and $RESP_BODY
+# Writes body to a temp file to avoid busybox subshell/pipe issues with
+# multi-line JSON and the -w sentinel approach.
+# ─────────────────────────────────────────────────────────────────────
 api_call() {
-  method="$1"; url="$2"; token="$3"
-  curl --http1.1 -sS \
-    -X "$method" \
+  _token="$1"; _url="$2"
+  _body_tmp=$(mktemp)
+  RESP_CODE=$(curl --http1.1 -sS \
     -H "Accept: application/vnd.github+json" \
-    -H "Authorization: Bearer ${token}" \
+    -H "Authorization: Bearer ${_token}" \
     -H "X-GitHub-Api-Version: ${API_VERSION}" \
-    -w "\n===STATUS===%{http_code}" \
-    "$url" 2>&1 || true
+    -o "$_body_tmp" \
+    -w "%{http_code}" \
+    "$_url" 2>/dev/null) || RESP_CODE="000"
+  RESP_BODY=$(cat "$_body_tmp" 2>/dev/null || true)
+  rm -f "$_body_tmp"
 }
 
+# ─────────────────────────────────────────────────────────────────────
+# api_download TOKEN URL OUTFILE -> sets $RESP_CODE
+# ─────────────────────────────────────────────────────────────────────
 api_download() {
-  url="$1"; token="$2"; outfile="$3"
-  curl --http1.1 -sS -L \
+  _token="$1"; _url="$2"; _outfile="$3"
+  RESP_CODE=$(curl --http1.1 -sS -L \
     -H "Accept: application/vnd.github+json" \
-    -H "Authorization: Bearer ${token}" \
+    -H "Authorization: Bearer ${_token}" \
     -H "X-GitHub-Api-Version: ${API_VERSION}" \
-    -w "\n===STATUS===%{http_code}" \
-    -o "$outfile" \
-    "$url" 2>&1 || true
+    -o "$_outfile" \
+    -w "%{http_code}" \
+    "$_url" 2>/dev/null) || RESP_CODE="000"
 }
 
-parse_code() { printf '%s' "$1" | grep '===STATUS===' | sed 's/.*===STATUS===//'; }
-parse_body() { printf '%s' "$1" | sed '/===STATUS===/d'; }
-
-# ── get_login ──────────────────────────────────────────────────────────────────
-# Returns the GitHub login for the given PAT, or empty string on failure.
-# Prints detailed diagnostics so token permission issues are visible in the log.
+# ── get_login ─────────────────────────────────────────────────────────────────
 get_login() {
-  token="$1"
-  raw=$(api_call GET "https://api.github.com/user" "$token")
-  code=$(parse_code "$raw")
-  body=$(parse_body "$raw")
-
-  if [ "${code:-0}" != "200" ]; then
-    err "  GET /user -> HTTP ${code:-curl_error}"
-    err "  Response : ${body}"
-    err "  Hint     : fine-grained PAT needs Account > User permissions (read)"
-    err "             OR use a classic PAT with 'repo' scope"
+  _token="$1"
+  api_call "$_token" "https://api.github.com/user"
+  if [ "$RESP_CODE" != "200" ]; then
+    err "  GET /user -> HTTP ${RESP_CODE}"
+    err "  Response : ${RESP_BODY}"
+    err "  Hint     : fine-grained PAT needs 'Account permissions > Profile: Read'"
+    err "             Classic PAT needs 'repo' or 'read:user' scope"
     return 1
   fi
-
-  login=$(printf '%s' "$body" | jq -r '.login // empty' 2>/dev/null || true)
-  if [ -z "${login:-}" ]; then
-    err "  Could not parse .login from: ${body}"
+  _login=$(printf '%s' "$RESP_BODY" | jq -r '.login // empty' 2>/dev/null || true)
+  if [ -z "${_login:-}" ]; then
+    err "  Could not parse .login — raw response: ${RESP_BODY}"
     return 1
   fi
-  printf '%s' "$login"
+  printf '%s' "$_login"
 }
 
-# ── list_repos_page ────────────────────────────────────────────────────────────
+# ── list_repos_page ───────────────────────────────────────────────────────────
 list_repos_page() {
-  token="$1"; page="$2"; login="$3"
-  raw=$(api_call GET \
-    "https://api.github.com/user/repos?type=owner&per_page=100&page=${page}" \
-    "$token")
-  code=$(parse_code "$raw")
-  body=$(parse_body "$raw")
-
-  if [ "${code:-0}" != "200" ]; then
-    err "[${login}] GET /user/repos page ${page} -> HTTP ${code:-curl_error}"
-    err "[${login}] Response: ${body}"
+  _token="$1"; _page="$2"; _login="$3"
+  api_call "$_token" \
+    "https://api.github.com/user/repos?type=owner&per_page=100&page=${_page}"
+  if [ "$RESP_CODE" != "200" ]; then
+    err "[${_login}] GET /user/repos page ${_page} -> HTTP ${RESP_CODE}"
+    err "[${_login}] Response: ${RESP_BODY}"
     printf '[]'
     return 0
   fi
-  printf '%s' "$body"
+  printf '%s' "$RESP_BODY"
 }
 
-# ── download_zipball ───────────────────────────────────────────────────────────
-# HTTP 400/409 = empty/uninitialised repo — logged as WARN, not ERROR.
-# HTTP 404     = repo gone or no permission — logged as WARN.
-# Any other non-2xx = ERROR.
+# ── download_zipball ──────────────────────────────────────────────────────────
 download_zipball() {
-  token="$1"; full_name="$2"; outfile="$3"; login="$4"
-
-  tmpfile=$(mktemp "${outfile}.XXXXXX")
-  raw=$(api_download \
-    "https://api.github.com/repos/${full_name}/zipball" \
-    "$token" "$tmpfile")
-  code=$(parse_code "$raw")
-
-  # A successful redirect chain ends on 200; check file is non-empty too
-  if [ "${code:-0}" -ge 200 ] 2>/dev/null && \
-     [ "${code:-0}" -lt 300 ] 2>/dev/null && \
-     [ -s "$tmpfile" ]; then
-    mv "$tmpfile" "$outfile"
-    log "[${login}] OK       ${full_name}  ($(du -k "$outfile" | cut -f1) KB)"
+  _token="$1"; _full_name="$2"; _outfile="$3"; _login="$4"
+  _tmpfile=$(mktemp "${_outfile}.XXXXXX")
+  api_download "$_token" \
+    "https://api.github.com/repos/${_full_name}/zipball" \
+    "$_tmpfile"
+  _code="$RESP_CODE"
+  if [ "${_code}" -ge 200 ] 2>/dev/null && \
+     [ "${_code}" -lt 300 ] 2>/dev/null && \
+     [ -s "$_tmpfile" ]; then
+    mv "$_tmpfile" "$_outfile"
+    log "[${_login}] OK       ${_full_name}  ($(du -k "$_outfile" | cut -f1) KB)"
     return 0
   fi
-
-  rm -f "$tmpfile"
-
-  case "${code:-0}" in
-    400|409)
-      warn "[${login}] EMPTY    ${full_name}  (HTTP ${code} — repo has no commits, skipped)"
-      return 2  # distinct exit code: skip, not failure
-      ;;
-    404)
-      warn "[${login}] NOTFOUND ${full_name}  (HTTP 404 — no access or deleted)"
-      return 2
-      ;;
-    *)
-      err  "[${login}] FAILED   ${full_name}  (HTTP ${code:-curl_error})"
-      return 1
-      ;;
+  rm -f "$_tmpfile"
+  case "${_code}" in
+    400|409) warn "[${_login}] EMPTY    ${_full_name}  (HTTP ${_code} — no commits)"; return 2 ;;
+    404)     warn "[${_login}] NOTFOUND ${_full_name}  (HTTP 404)"; return 2 ;;
+    *)       err  "[${_login}] FAILED   ${_full_name}  (HTTP ${_code})"; return 1 ;;
   esac
 }
 
-# ── main ───────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 [ -f "$TOKENS_FILE" ] || { err "Tokens file not found: $TOKENS_FILE"; exit 1; }
 
 log "========== backup start  (pid $$) =========="
 log "BACKUP_ROOT : $BACKUP_ROOT"
 log "LOG_FILE    : $LOG_FILE"
 
-while IFS= read -r OAUTH_TOKEN || [ -n "${OAUTH_TOKEN:-}" ]; do
-  [ -z "${OAUTH_TOKEN:-}" ] && continue
-  case "$OAUTH_TOKEN" in \#*) continue ;; esac
+while IFS= read -r RAW_LINE || [ -n "${RAW_LINE:-}" ]; do
+  # Strip carriage return (CRLF files from Windows editors)
+  OAUTH_TOKEN=$(printf '%s' "${RAW_LINE}" | tr -d '\r')
+  # Skip blank lines and comments
+  case "${OAUTH_TOKEN}" in
+    ''|\#*) continue ;;
+  esac
 
   TOKEN_HINT="$(printf '%s' "$OAUTH_TOKEN" | cut -c1-20)..."
   log "--- token: ${TOKEN_HINT}"
@@ -188,25 +165,21 @@ while IFS= read -r OAUTH_TOKEN || [ -n "${OAUTH_TOKEN:-}" ]; do
     while IFS="$(printf '\t')" read -r REPONAME FULL_NAME REPO_SIZE; do
       [ -z "${REPONAME:-}" ] && continue
       OUTFILE="${ACCOUNT_PATH}/${REPONAME}.zip"
-
-      # GitHub API reports size=0 for empty/uninitialised repos — skip early
       if [ "${REPO_SIZE:-1}" = "0" ]; then
-        warn "[${LOGIN}] EMPTY    ${FULL_NAME}  (size=0 in API, no commits)"
+        warn "[${LOGIN}] EMPTY    ${FULL_NAME}  (size=0, no commits)"
         ACCOUNT_SKIP=$((ACCOUNT_SKIP + 1))
         SCRIPT_SKIP_EMPTY=$((SCRIPT_SKIP_EMPTY + 1))
         continue
       fi
-
       download_zipball "$OAUTH_TOKEN" "$FULL_NAME" "$OUTFILE" "$LOGIN"
       rc=$?
       case $rc in
-        0) ACCOUNT_OK=$((ACCOUNT_OK + 1));   SCRIPT_OK=$((SCRIPT_OK + 1)) ;;
+        0) ACCOUNT_OK=$((ACCOUNT_OK + 1));     SCRIPT_OK=$((SCRIPT_OK + 1)) ;;
         2) ACCOUNT_SKIP=$((ACCOUNT_SKIP + 1)); SCRIPT_SKIP_EMPTY=$((SCRIPT_SKIP_EMPTY + 1)) ;;
         *) ACCOUNT_FAIL=$((ACCOUNT_FAIL + 1)); SCRIPT_FAIL=$((SCRIPT_FAIL + 1)) ;;
       esac
     done < "$tsv_tmp"
     rm -f "$tsv_tmp"
-
     page=$((page + 1))
   done
 
