@@ -4,8 +4,10 @@
 # Tokens file: one PAT per line, blank/comment lines ignored, CRLF stripped.
 # Logs are APPENDED to $LOG_FILE so history is preserved across runs.
 #
-# Busybox-safe: no pipefail, no -w sentinel parsing via grep/sed.
-# HTTP status captured by writing body and code to separate temp files.
+# Busybox-safe: HTTP code via -o tmpfile + -w %{http_code}.
+# Download success is determined by non-empty output file only —
+# NOT by HTTP code, because busybox curl -L returns the redirect code (302)
+# instead of the final 200, which broke the mv step.
 
 BACKUP_ROOT="/volume1/homes/Dominik/sourcecode/github"
 TOKENS_FILE="/volume1/homes/Dominik/sourcecode/github_tokens.txt"
@@ -32,11 +34,11 @@ require_cmd curl
 require_cmd jq
 require_cmd mktemp
 
-# ─────────────────────────────────────────────────────────────────────
-# api_call TOKEN URL -> sets $RESP_CODE and $RESP_BODY
-# Writes body to a temp file to avoid busybox subshell/pipe issues with
-# multi-line JSON and the -w sentinel approach.
-# ─────────────────────────────────────────────────────────────────────
+# Clean up any leftover temp files from previous crashed runs
+log "Cleaning up stale temp files in ${BACKUP_ROOT}..."
+find "$BACKUP_ROOT" -name '*.zip.*' -type f -delete 2>/dev/null || true
+
+# ── api_call: sets RESP_CODE and RESP_BODY ────────────────────────────────────
 api_call() {
   _token="$1"; _url="$2"
   _body_tmp=$(mktemp)
@@ -51,18 +53,19 @@ api_call() {
   rm -f "$_body_tmp"
 }
 
-# ─────────────────────────────────────────────────────────────────────
-# api_download TOKEN URL OUTFILE -> sets $RESP_CODE
-# ─────────────────────────────────────────────────────────────────────
+# ── api_download: downloads to file, success = non-empty file ─────────────────
+# We do NOT check HTTP code here because busybox curl -L reports the
+# redirect status (302) rather than the final response code (200).
+# A non-empty output file is the reliable success indicator.
 api_download() {
   _token="$1"; _url="$2"; _outfile="$3"
-  RESP_CODE=$(curl --http1.1 -sS -L \
+  curl --http1.1 -sS -L \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${_token}" \
     -H "X-GitHub-Api-Version: ${API_VERSION}" \
     -o "$_outfile" \
-    -w "%{http_code}" \
-    "$_url" 2>/dev/null) || RESP_CODE="000"
+    "$_url" 2>/dev/null
+  return $?
 }
 
 # ── get_login ─────────────────────────────────────────────────────────────────
@@ -78,7 +81,7 @@ get_login() {
   fi
   _login=$(printf '%s' "$RESP_BODY" | jq -r '.login // empty' 2>/dev/null || true)
   if [ -z "${_login:-}" ]; then
-    err "  Could not parse .login — raw response: ${RESP_BODY}"
+    err "  Could not parse .login — raw: ${RESP_BODY}"
     return 1
   fi
   printf '%s' "$_login"
@@ -102,23 +105,34 @@ list_repos_page() {
 download_zipball() {
   _token="$1"; _full_name="$2"; _outfile="$3"; _login="$4"
   _tmpfile=$(mktemp "${_outfile}.XXXXXX")
-  api_download "$_token" \
-    "https://api.github.com/repos/${_full_name}/zipball" \
-    "$_tmpfile"
-  _code="$RESP_CODE"
-  if [ "${_code}" -ge 200 ] 2>/dev/null && \
-     [ "${_code}" -lt 300 ] 2>/dev/null && \
-     [ -s "$_tmpfile" ]; then
+
+  if api_download "$_token" \
+       "https://api.github.com/repos/${_full_name}/zipball" \
+       "$_tmpfile" && [ -s "$_tmpfile" ]; then
     mv "$_tmpfile" "$_outfile"
     log "[${_login}] OK       ${_full_name}  ($(du -k "$_outfile" | cut -f1) KB)"
     return 0
+  else
+    # Check if curl wrote a JSON error body (e.g. {"message":"Not Found"})
+    _errmsg=$(cat "$_tmpfile" 2>/dev/null | jq -r '.message // empty' 2>/dev/null || true)
+    rm -f "$_tmpfile"
+    if [ -n "${_errmsg:-}" ]; then
+      case "${_errmsg}" in
+        *"empty"*|*"no default branch"*|*"409"*)
+          warn "[${_login}] EMPTY    ${_full_name}  (${_errmsg})"
+          return 2 ;;
+        *"Not Found"*)
+          warn "[${_login}] NOTFOUND ${_full_name}  (${_errmsg})"
+          return 2 ;;
+        *)
+          err  "[${_login}] FAILED   ${_full_name}  (${_errmsg})"
+          return 1 ;;
+      esac
+    else
+      err "[${_login}] FAILED   ${_full_name}  (empty output, curl error)"
+      return 1
+    fi
   fi
-  rm -f "$_tmpfile"
-  case "${_code}" in
-    400|409) warn "[${_login}] EMPTY    ${_full_name}  (HTTP ${_code} — no commits)"; return 2 ;;
-    404)     warn "[${_login}] NOTFOUND ${_full_name}  (HTTP 404)"; return 2 ;;
-    *)       err  "[${_login}] FAILED   ${_full_name}  (HTTP ${_code})"; return 1 ;;
-  esac
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -129,9 +143,7 @@ log "BACKUP_ROOT : $BACKUP_ROOT"
 log "LOG_FILE    : $LOG_FILE"
 
 while IFS= read -r RAW_LINE || [ -n "${RAW_LINE:-}" ]; do
-  # Strip carriage return (CRLF files from Windows editors)
   OAUTH_TOKEN=$(printf '%s' "${RAW_LINE}" | tr -d '\r')
-  # Skip blank lines and comments
   case "${OAUTH_TOKEN}" in
     ''|\#*) continue ;;
   esac
