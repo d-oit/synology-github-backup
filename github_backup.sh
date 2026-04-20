@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+
+BACKUP_ROOT="/volume1/homes/Dominik/sourcecode/github"
+TOKENS_FILE="/volume1/homes/Dominik/sourcecode/github_tokens.txt"
+API_VERSION="2022-11-28"
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: missing required command: $1" >&2
+    exit 1
+  }
+}
+
+require_cmd curl
+require_cmd jq
+require_cmd mktemp
+
+mkdir -p "$BACKUP_ROOT"
+
+get_login() {
+  token="$1"
+  curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${token}" \
+    -H "X-GitHub-Api-Version: ${API_VERSION}" \
+    "https://api.github.com/user" | jq -r '.login'
+}
+
+list_repos_page() {
+  token="$1"
+  page="$2"
+  curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${token}" \
+    -H "X-GitHub-Api-Version: ${API_VERSION}" \
+    "https://api.github.com/user/repos?type=owner&per_page=100&page=${page}"
+}
+
+download_zipball() {
+  token="$1"
+  full_name="$2"
+  outfile="$3"
+
+  tmpfile="$(mktemp "${outfile}.XXXXXX")"
+  trap 'rm -f "$tmpfile"' INT TERM HUP EXIT
+
+  curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${token}" \
+    -H "X-GitHub-Api-Version: ${API_VERSION}" \
+    "https://api.github.com/repos/${full_name}/zipball" \
+    -o "$tmpfile"
+
+  mv "$tmpfile" "$outfile"
+  trap - INT TERM HUP EXIT
+}
+
+if [ ! -f "$TOKENS_FILE" ]; then
+  echo "ERROR: tokens file not found: $TOKENS_FILE" >&2
+  exit 1
+fi
+
+while IFS= read -r OAUTH_TOKEN || [ -n "${OAUTH_TOKEN:-}" ]; do
+  [ -z "${OAUTH_TOKEN:-}" ] && continue
+
+  case "$OAUTH_TOKEN" in
+    \#*) continue ;;
+  esac
+
+  LOGIN="$(get_login "$OAUTH_TOKEN")"
+
+  if [ -z "$LOGIN" ] || [ "$LOGIN" = "null" ]; then
+    echo "ERROR: could not resolve GitHub login for one token" >&2
+    continue
+  fi
+
+  ACCOUNT_PATH="${BACKUP_ROOT}/${LOGIN}"
+  mkdir -p "$ACCOUNT_PATH"
+
+  echo "=== Backing up account: ${LOGIN} ==="
+
+  page=1
+  while :; do
+    JSON="$(list_repos_page "$OAUTH_TOKEN" "$page")"
+    COUNT="$(printf '%s' "$JSON" | jq 'length')"
+    [ "$COUNT" -eq 0 ] && break
+
+    printf '%s' "$JSON" | jq -r '.[] | [.name, .full_name] | @tsv' |
+    while IFS="$(printf '\t')" read -r REPONAME FULL_NAME; do
+      [ -z "${REPONAME:-}" ] && continue
+      OUTFILE="${ACCOUNT_PATH}/${REPONAME}.zip"
+      echo "Downloading ${FULL_NAME} -> ${OUTFILE}"
+      download_zipball "$OAUTH_TOKEN" "$FULL_NAME" "$OUTFILE"
+    done
+
+    page=$((page + 1))
+  done
+done < "$TOKENS_FILE"
