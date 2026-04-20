@@ -8,10 +8,10 @@ and uses it as the subfolder name.
 
 ```
 /volume1/homes/Dominik/sourcecode/github/
-  d-oit/
+  d-1/
     repo-a.zip
     repo-b.zip
-  d-o-hub/
+  d-2/
     repo-x.zip
 ```
 
