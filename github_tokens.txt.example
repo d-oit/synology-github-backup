@@ -1,8 +1,8 @@
 # One PAT per line. Comment lines starting with # are ignored.
 # Fine-grained PATs need: Contents: Read-only, Metadata: Read-only
 
-# Account: d-oit
-github_pat_REPLACE_THIS_FOR_D_OIT
+# Account: account1
+github_pat_REPLAC
 
-# Account: d-o-hub
-github_pat_REPLACE_THIS_FOR_D_O_HUB
+# Account: account2
+github_pat_REPLAC
